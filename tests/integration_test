@@ -1,0 +1,283 @@
+#!/bin/bash
+
+readonly SNAPSHOT_TEST_USAGE="Usage: snapshot_test <tmpdir> <test name> <test block size (bytes)> <sector size (bytes)> <chunk size (sectors)> <expected chunks> <expected sparseness> [DNZHE][DNZHE]..."
+snapshot_test() {
+  local -r name="$2"
+  local -r dir="$1/${name}"
+  local -r ss="$4"
+  local -r cs="$5"
+  local -r bs="${3:-$((${ss:-512} * ${cs:-2048}))}"
+  local -r nc="$6"
+  local -r sparse_diff="$7"
+  shift 7
+
+  echo >&2
+  echo >&2 "Setting up test ${name}"
+  if [[ -z "${name}" || -z "${nc}" || -z "${sparse_diff}" ]]; then
+    echo >&2 "FAILED ${name}: ${SNAPSHOT_TEST_USAGE}"
+    return 1
+  fi
+  if ! mkdir "${dir}"; then
+    echo >&2 "FAILED ${name}: mkdir failed"
+    return 1
+  fi
+  local -r orig="${dir}/orig" dest="${dir}/dest" data="${dir}/data" orig_pipe="${dir}/orig_pipe" dest_pipe="${dir}/dest_pipe"
+  local bb orig_b dest_b
+  local i=0 orig_eof=0 dest_eof=0
+  local ret
+  for bb; do
+    if [[ "${#bb}" != 2 ]]; then
+      echo >&2 "FAILED ${name}: ${SNAPSHOT_TEST_USAGE}" 
+      return 1
+    fi
+    orig_b="${bb:0:1}"
+    dest_b="${bb:1:1}"
+    snapshot_test_write_block "${orig}" "${orig_eof}" "${data}" "${bs}" "${i}" "${orig_b}"
+    ret="$?"
+    case "${ret}" in
+      0) ;;
+      2) orig_eof=1;;
+      *)
+        echo >&2 "FAILED ${name}: writing block ${orig_b} to orig"
+        return "${ret}"
+        ;;
+    esac
+    snapshot_test_write_block "${dest}" "${dest_eof}" "${data}" "${bs}" "${i}" "${dest_b}"
+    ret="$?"
+    case "${ret}" in
+      0) ;;
+      2) dest_eof=1;;
+      *)
+        echo >&2 "FAILED ${name}: writing block ${orig_b} to orig"
+        return "${ret}"
+        ;;
+    esac
+    rm -f "${data}"
+    : $((i++))
+  done
+
+  echo >&2 "Running test ${name}"
+  local is_root
+  if ! is_root="$(id -u)"; then
+    echo >&2 "FAILED ${name}: not sure if root"
+    return 1
+  fi
+  is_root=$((${is_root} == 0))
+  readonly is_root
+  local -a types=(file pipe)
+  ((is_root)) && types+=(dev)
+  readonly types
+  local orig_type dest_type
+  local diff dstat ds dbb dbs fsbs
+  local orig_actual dest_actual orig_dev diff_dev
+  local unused
+  ret=0
+  for unused in unused; do
+    if ! mkfifo "${orig_pipe}"; then
+      echo >&2 "FAILED ${name}: mkfifo orig failed"
+      : $((ret++))
+      break
+    fi
+    if ! mkfifo "${dest_pipe}"; then
+      echo >&2 "FAILED ${name}: mkfifo dest failed"
+      : $((ret++))
+      break
+    fi
+    if ((is_root)); then
+      if ! losetup ${ss:+--sector-size=${ss}} --read-only --find "${orig}"; then
+        echo >&2 "FAILED ${name}: losetup orig failed"
+        : $((ret++))
+        break
+      fi
+      orig_dev="$(losetup --associated "${orig}" --output NAME --noheadings)"
+    fi
+    for orig_type in ${types[@]}; do
+      case "${orig_type}" in
+        file) orig_actual="${orig}";;
+        pipe) orig_actual="${orig_pipe}";;
+        dev) orig_actual="${orig_dev}";;
+      esac
+      for dest_type in ${types[@]}; do
+        case "${dest_type}" in
+          file) dest_actual="${dest}";;
+          pipe) dest_actual="${dest_pipe}";;
+          dev)
+            if ! losetup ${ss:+--sector-size=${ss}} --read-only --find "${dest}"; then
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: losetup dest failed"
+              : $((ret++))
+              continue
+            fi
+            dest_actual="$(losetup --associated "${dest}" --output NAME --noheadings)"
+            ;;
+        esac
+        for unused in unused; do
+          echo >&2 "  ${orig_type}/${dest_type}"
+          [[ "${orig_type}" == "pipe" ]] && cat "${orig}" > "${orig_pipe}" &
+          [[ "${dest_type}" == "pipe" ]] && cat "${dest}" > "${dest_pipe}" &
+          diff="${dir}/diff-${orig_type}-${dest_type}"
+          if ! target/debug/snapshot-diff --orig="${orig_actual}" --dest="${dest_actual}" --diff="${diff}" ${ss:+--ss=${ss}} ${cs:+--cs=${cs}}; then
+            if ((nc)); then
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: expected ${nc} chunks, got tool error"
+              : $((ret++))
+            fi
+            break
+          fi
+          if ((! nc)); then
+            echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: expected tool failure, got success"
+            : $((ret++))
+            break
+          fi
+          if dstat="$(stat --format="%s %b %B" "${diff}")"; then
+            read ds dbb dbs <<< "${dstat}"
+            if (( "${ds}" != "$((${ss:-512} * ${cs:-2048} * ${nc}))" )); then
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: expected $((${ss:-512} * ${cs:-2048} * ${nc})) bytes in ${nc} chunks, got ${ds} bytes"
+              : $((ret++))
+            fi
+            # The first two chunks typically have big holes
+            if fsbs="$(stat --file-system --format=%S "${diff}")"; then
+              if ((sparse_diff != (${dbb} * ${dbs} < ${ds} - ${bs} - ${bs} + ${fsbs} + ${fsbs}))); then
+                echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: expected sparse_diff ${sparse_diff}, got $((${dbb} * ${dbs})) allocated for a ${ds} byte file"
+                : $((ret++))
+              fi
+            else
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: stat failed"
+              : $((ret++))
+            fi
+          else
+            echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: stat failed"
+            : $((ret++))
+          fi
+          if ((is_root)); then
+            if losetup ${ss:+--sector-size=${ss}} --read-only --find "${diff}"; then
+              diff_dev="$(losetup --associated "${diff}" --output NAME --noheadings)"
+              if dmsetup create snapshot-diff-integration-test --readonly --table "0 $((${bs} * $# / ${ss:-512})) snapshot ${orig_dev} ${diff_dev} P ${cs:-2048}"; then
+                if ! cmp /dev/mapper/snapshot-diff-integration-test "${dest}"; then
+                  echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: snapshot device doesn't match destination file"
+                  : $((ret++))
+                fi
+                if ! dmsetup remove --retry snapshot-diff-integration-test; then
+                  echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: dmsetup remove failed"
+                  : $((ret++))
+                fi
+              else
+                echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: dmsetup create failed"
+                : $((ret++))
+              fi
+              if ! losetup --detach "${diff_dev}"; then
+                echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: losetup --detach diff failed"
+                : $((ret++))
+              fi
+            else
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: losetup diff failed"
+              : $((ret++))
+            fi
+          fi
+        done
+        case "${dest_type}" in
+          dev)
+            if ! losetup --detach "${dest_actual}"; then
+              echo >&2 "FAILED ${name} ${orig_type} ${dest_type}: losetup --detach dest failed"
+              : $((ret++))
+            fi
+            ;;
+        esac
+      done
+    done
+    if ((is_root)); then
+      if ! losetup --detach "${orig_dev}"; then
+        echo >&2 "FAILED ${name}: losetup --detach orig failed"
+        : $((ret++))
+      fi
+    fi
+  done
+  if [[ -t 0 ]]; then
+    if ((! ret)); then
+      echo >&2 -e "\x1b[92mPASSED\x1b[0m: ${name}"
+    else
+      echo >&2 -e "\x1b[91mFAIED\x1b[0m: ${name}"
+    fi
+  else
+    if ((ret)); then
+      echo >&2 "PASSED: ${name}"
+    else
+      echo >&2 "FAILED: ${name}"
+    fi
+  fi
+  return "${ret}"
+}
+
+snapshot_test_write_block() {
+  local -r file="$1"
+  local -r eof="$2"
+  local -r data="$3"
+  local -r bs="$4"
+  local -r bn="$5"
+  local -r b="$6"
+  if ((eof)) && [[ "${b}" != "E" ]]; then
+    echo >&2 "Unexpected pattern character ${b} after [E]OF; wanted E"
+    return 1
+  fi
+  local -a dd=(dd bs="${bs}" conv=notrunc count=1 of="${file}" seek="${bn}" status=none)
+  case "${b}" in
+    "D")  # Data
+      [[ -r "${data}" ]] || dd bs="${bs}" count=1 of="${data}" status=none if="/dev/urandom" || return 1
+      "${dd[@]}" if="${data}" || return 1
+      ;;
+    "N")  # Newdata
+      "${dd[@]}" if="/dev/urandom" || return 1
+      ;;
+    "Z")  # Zeroes
+      "${dd[@]}" if="/dev/zero" || return 1
+      ;;
+    "H")  # Hole
+      truncate --size="$((${bs} * (${bn} + 1)))" "${file}" || return 1
+      ;;
+    "E")  # EOF
+      return 2
+      ;;
+    *)
+      echo >&2 "Unexpected pattern character ${b}; wanted [D]ata [N]ewdata [Z]eroes [H]ole or [E]OF"
+      return 1
+      ;;
+  esac
+  :
+}
+
+ret=0
+dir="$(mktemp --directory snapshot-diff-integration-test.XXXXXXXXXX --tmpdir)" || exit
+echo >&2 "Running tests in ${dir}"
+snapshot_test "${dir}" uneven       512 512 2048 0 0   DD DD DD DN DD
+: $(($? && ret++))
+snapshot_test "${dir}" short_dest       "" "" "" 0 0   DD DN DD DE DE
+: $(($? && ret++))
+snapshot_test "${dir}" long_dest        "" "" "" 0 0   DD DN DD ED ED
+: $(($? && ret++))
+snapshot_test "${dir}" holes_to_holes   "" "" "" 3 0   HH DD HH DN HH
+: $(($? && ret++))
+snapshot_test "${dir}" holes_to_zeroes  "" "" "" 3 0   HZ DD HZ DN HZ
+: $(($? && ret++))
+snapshot_test "${dir}" holes_to_data    "" "" "" 6 0   HD DD HD DN HD
+: $(($? && ret++))
+snapshot_test "${dir}" zeroes_to_holes  "" "" "" 3 0   ZH DD ZH DN ZH
+: $(($? && ret++))
+snapshot_test "${dir}" zeroes_to_zeroes "" "" "" 3 0   ZZ DD ZZ DN ZZ
+: $(($? && ret++))
+snapshot_test "${dir}" zeroes_to_data   "" "" "" 6 0   ZD DD ZD DN ZD
+: $(($? && ret++))
+snapshot_test "${dir}" data_to_holes    "" "" "" 6 1   DH DD DH DN DH
+: $(($? && ret++))
+snapshot_test "${dir}" data_to_zeroes   "" "" "" 6 1   DZ DD DZ DN DZ
+: $(($? && ret++))
+snapshot_test "${dir}" data_to_data     "" "" "" 3 0   DD DD DD DN DD
+: $(($? && ret++))
+snapshot_test "${dir}" data_to_newdata  "" "" "" 6 0   DN DD DN DN DN
+: $(($? && ret++))
+snapshot_test "${dir}" no_diff          "" "" "" 0 0   DD DD DD DD DD
+: $(($? && ret++))
+if ((ret)); then
+  echo >&2
+  echo >&2 "FAILURES; leaving temporary files in ${dir} for diagnosis"
+else
+  rm -rf "${dir}"
+fi
+exit "${ret}"

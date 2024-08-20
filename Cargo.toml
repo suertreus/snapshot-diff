@@ -1,0 +1,13 @@
+[package]
+name = "snapshot-diff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+fallible-streaming-iterator = "0.1"
+io-block = "0.2"
+
+[dependencies.clap]
+version = "4.5"
+features = ["derive"]
